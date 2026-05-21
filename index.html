@@ -1,0 +1,795 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Research Agent</title>
+
+    <!--
+      Single-file frontend.
+
+      Why no framework?
+      - Keeps the project trivial to run (no npm, no build step).
+      - Server-Sent Events from POST /research are read with `fetch` +
+        ReadableStream, which is native to every modern browser.
+      - `marked.js` (loaded from a CDN) handles Markdown rendering for the
+        final report.
+    -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
+    <style>
+      /* ---------- Theme tokens (warm light, editorial) ---------- */
+      :root {
+        --bg: #fafaf9;
+        --surface: #ffffff;
+        --surface-2: #f5f5f4;
+        --border: #e7e5e4;
+        --border-strong: #d6d3d1;
+        --text: #1c1917;
+        --text-soft: #44403c;
+        --muted: #78716c;
+        --link: #1d4ed8;
+        --ring: rgba(29, 78, 216, 0.18);
+        --danger: #b91c1c;
+        --mono:
+          ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto,
+          system-ui, sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        height: 100%;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: var(--sans);
+        font-size: 15px;
+        line-height: 1.6;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        display: flex;
+        flex-direction: column;
+        min-height: 100vh;
+      }
+
+      /* ---------- Header ---------- */
+      header {
+        padding: 28px 32px 22px;
+        border-bottom: 1px solid var(--border);
+        background: var(--surface);
+      }
+
+      .title {
+        margin: 0 0 18px;
+      }
+
+      .title h1 {
+        margin: 0 0 2px;
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+
+      .title .subtitle {
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      .search-row {
+        display: flex;
+        gap: 8px;
+        align-items: stretch;
+        max-width: 880px;
+      }
+
+      .search-row input {
+        flex: 1;
+        background: var(--surface);
+        border: 1px solid var(--border-strong);
+        color: var(--text);
+        border-radius: 8px;
+        padding: 10px 13px;
+        font-size: 14px;
+        font-family: var(--sans);
+        outline: none;
+        transition:
+          border-color 0.15s ease,
+          box-shadow 0.15s ease;
+      }
+      .search-row input::placeholder {
+        color: var(--muted);
+      }
+      .search-row input:focus {
+        border-color: var(--link);
+        box-shadow: 0 0 0 3px var(--ring);
+      }
+
+      .search-row button {
+        background: var(--text);
+        color: var(--surface);
+        border: 1px solid var(--text);
+        border-radius: 8px;
+        padding: 0 18px;
+        font-weight: 500;
+        font-size: 14px;
+        cursor: pointer;
+        transition:
+          background-color 0.15s ease,
+          border-color 0.15s ease;
+      }
+      .search-row button:hover:not(:disabled) {
+        background: #000;
+        border-color: #000;
+      }
+      .search-row button:disabled,
+      .search-row input:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      /* ---------- Main layout ---------- */
+      main {
+        flex: 1;
+        display: grid;
+        grid-template-columns: 35% 65%;
+        gap: 16px;
+        padding: 20px 32px;
+        min-height: 0; /* allow children to scroll */
+      }
+
+      .panel {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        overflow: hidden;
+      }
+
+      .panel-header {
+        padding: 11px 16px;
+        border-bottom: 1px solid var(--border);
+        background: var(--surface-2);
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        color: var(--text-soft);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+
+      .panel-header .meta {
+        font-weight: 400;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .panel-body {
+        flex: 1;
+        overflow-y: auto;
+        padding: 14px 18px;
+      }
+
+      /* ---------- Activity log ---------- */
+      #activity .panel-body {
+        font-family: var(--mono);
+        font-size: 12.5px;
+        line-height: 1.6;
+      }
+
+      .activity-item {
+        padding: 6px 0;
+        border-bottom: 1px solid var(--border);
+        white-space: pre-wrap;
+        word-break: break-word;
+        color: var(--text-soft);
+      }
+      .activity-item:last-child {
+        border-bottom: none;
+      }
+      .activity-item.error {
+        color: var(--danger);
+      }
+      .activity-item.system {
+        color: var(--muted);
+      }
+
+      /* ---------- Report ---------- */
+      #report .panel-body {
+        font-size: 15px;
+        max-width: 780px;
+        padding: 22px 26px;
+      }
+
+      #report-content h1,
+      #report-content h2,
+      #report-content h3,
+      #report-content h4 {
+        color: var(--text);
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        margin-top: 1.6em;
+        margin-bottom: 0.4em;
+        line-height: 1.3;
+      }
+      #report-content h1 {
+        font-size: 22px;
+      }
+      #report-content h2 {
+        font-size: 18px;
+      }
+      #report-content h3 {
+        font-size: 16px;
+      }
+      #report-content p {
+        color: var(--text-soft);
+      }
+      #report-content a {
+        color: var(--link);
+        text-decoration: underline;
+        text-decoration-color: rgba(29, 78, 216, 0.35);
+        text-underline-offset: 2px;
+        word-break: break-word;
+      }
+      #report-content a:hover {
+        text-decoration-color: var(--link);
+      }
+      #report-content code {
+        background: var(--surface-2);
+        padding: 1px 5px;
+        border-radius: 4px;
+        font-family: var(--mono);
+        font-size: 0.9em;
+        border: 1px solid var(--border);
+      }
+      #report-content pre {
+        background: var(--surface-2);
+        padding: 12px 14px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        overflow-x: auto;
+      }
+      #report-content pre code {
+        background: transparent;
+        border: none;
+        padding: 0;
+      }
+      #report-content blockquote {
+        border-left: 3px solid var(--border-strong);
+        margin: 1em 0;
+        padding: 0.2em 0 0.2em 14px;
+        color: var(--muted);
+      }
+      #report-content ul,
+      #report-content ol {
+        padding-left: 22px;
+        color: var(--text-soft);
+      }
+      #report-content li {
+        margin: 0.25em 0;
+      }
+      #report-content table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 1em 0;
+        font-size: 14px;
+      }
+      #report-content th,
+      #report-content td {
+        border: 1px solid var(--border);
+        padding: 8px 10px;
+        text-align: left;
+      }
+      #report-content th {
+        background: var(--surface-2);
+        font-weight: 600;
+      }
+
+      .placeholder {
+        color: var(--muted);
+      }
+
+      .caret::after {
+        content: "";
+        display: inline-block;
+        width: 7px;
+        height: 1em;
+        background: var(--text);
+        margin-left: 2px;
+        vertical-align: text-bottom;
+        animation: blink 1s steps(2, start) infinite;
+      }
+      @keyframes blink {
+        to {
+          opacity: 0;
+        }
+      }
+
+      /* ---------- Footer (follow-up + download) ---------- */
+      footer {
+        padding: 14px 32px 20px;
+        border-top: 1px solid var(--border);
+        background: var(--surface);
+      }
+
+      .footer-row {
+        display: flex;
+        gap: 8px;
+        align-items: stretch;
+        max-width: 880px;
+      }
+
+      .footer-row input {
+        flex: 1;
+        background: var(--surface);
+        border: 1px solid var(--border-strong);
+        color: var(--text);
+        border-radius: 8px;
+        padding: 9px 13px;
+        font-size: 14px;
+        font-family: var(--sans);
+        outline: none;
+      }
+      .footer-row input::placeholder {
+        color: var(--muted);
+      }
+      .footer-row input:focus {
+        border-color: var(--link);
+        box-shadow: 0 0 0 3px var(--ring);
+      }
+
+      .footer-row button {
+        background: var(--surface);
+        color: var(--text);
+        border: 1px solid var(--border-strong);
+        border-radius: 8px;
+        padding: 0 16px;
+        font-weight: 500;
+        font-size: 14px;
+        cursor: pointer;
+        transition:
+          background-color 0.15s ease,
+          border-color 0.15s ease;
+      }
+      .footer-row button:hover:not(:disabled) {
+        background: var(--surface-2);
+        border-color: var(--text-soft);
+      }
+      .footer-row button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .footer-row button.hidden {
+        display: none;
+      }
+
+      .status {
+        margin-top: 10px;
+        font-size: 12px;
+        color: var(--muted);
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .status .indicator {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--border-strong);
+      }
+      .status.live .indicator {
+        background: var(--link);
+        animation: pulse 1.4s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.35;
+        }
+      }
+
+      /* ---------- Scrollbar polish ---------- */
+      .panel-body::-webkit-scrollbar {
+        width: 10px;
+      }
+      .panel-body::-webkit-scrollbar-thumb {
+        background: #e0ddd9;
+        border-radius: 8px;
+        border: 2px solid var(--surface);
+      }
+      .panel-body::-webkit-scrollbar-thumb:hover {
+        background: #cdc9c4;
+      }
+
+      /* ---------- Responsive ---------- */
+      @media (max-width: 900px) {
+        main {
+          grid-template-columns: 1fr;
+          padding: 16px;
+        }
+        header,
+        footer {
+          padding-left: 16px;
+          padding-right: 16px;
+        }
+        #activity {
+          max-height: 35vh;
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <header>
+      <div class="title">
+        <h1>Research Agent</h1>
+        <div class="subtitle">Autonomous web research, streamed live.</div>
+      </div>
+      <form id="search-form" class="search-row" autocomplete="off">
+        <input
+          id="query"
+          type="text"
+          placeholder="What would you like to research?"
+          required
+        />
+        <button id="submit-btn" type="submit">Research</button>
+      </form>
+    </header>
+
+    <main>
+      <section id="activity" class="panel">
+        <div class="panel-header">
+          <span>Agent Activity</span>
+          <span id="activity-count" class="meta">0 events</span>
+        </div>
+        <div id="activity-log" class="panel-body">
+          <div class="activity-item system">
+            Idle. Enter a topic above to start a research run.
+          </div>
+        </div>
+      </section>
+
+      <section id="report" class="panel">
+        <div class="panel-header">
+          <span>Report</span>
+          <span id="report-status" class="meta">waiting</span>
+        </div>
+        <div class="panel-body">
+          <div id="report-content">
+            <p class="placeholder">
+              The report will appear here once the agent has gathered enough
+              information.
+            </p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <form id="followup-form" class="footer-row" autocomplete="off">
+        <input
+          id="followup"
+          type="text"
+          placeholder="Ask a follow-up question…"
+          disabled
+        />
+        <button id="followup-btn" type="submit" disabled>Send</button>
+        <button id="download-btn" type="button" class="hidden">
+          Download Report
+        </button>
+      </form>
+      <div id="status" class="status">
+        <span class="indicator"></span>
+        <span id="status-text">Ready.</span>
+      </div>
+    </footer>
+
+    <script>
+      // ---------------------------------------------------------------------
+      // DOM refs
+      // ---------------------------------------------------------------------
+      const $form = document.getElementById("search-form");
+      const $query = document.getElementById("query");
+      const $submit = document.getElementById("submit-btn");
+
+      const $activityLog = document.getElementById("activity-log");
+      const $activityCount = document.getElementById("activity-count");
+
+      const $reportContent = document.getElementById("report-content");
+      const $reportStatus = document.getElementById("report-status");
+
+      const $followupForm = document.getElementById("followup-form");
+      const $followup = document.getElementById("followup");
+      const $followupBtn = document.getElementById("followup-btn");
+      const $downloadBtn = document.getElementById("download-btn");
+      const $status = document.getElementById("status");
+      const $statusText = document.getElementById("status-text");
+
+      // ---------------------------------------------------------------------
+      // State
+      // ---------------------------------------------------------------------
+      // Holds the latest *completed* report markdown so the download button
+      // can write it to disk without re-fetching anything.
+      let lastReportMarkdown = "";
+      let lastQuery = "";
+      // Active AbortController for the in-flight request, so we can cancel
+      // it if the user submits a follow-up before the previous run is done.
+      let activeController = null;
+      let activityEventCount = 0;
+
+      // Marked options: GitHub-flavored, breaks-on-newline so streaming feels
+      // more responsive while the report is being built up word by word.
+      marked.setOptions({
+        gfm: true,
+        breaks: true,
+        headerIds: false,
+        mangle: false,
+      });
+
+      // ---------------------------------------------------------------------
+      // UI helpers
+      // ---------------------------------------------------------------------
+
+      /**
+       * Append a new line to the agent activity log on the left panel.
+       * `kind` is "step" (default), "error", or "system".
+       */
+      function logActivity(text, kind = "step") {
+        const div = document.createElement("div");
+        div.className =
+          "activity-item" + (kind === "step" ? "" : " " + kind);
+        div.textContent = text;
+        $activityLog.appendChild(div);
+        // Auto-scroll to the latest entry.
+        $activityLog.scrollTop = $activityLog.scrollHeight;
+        activityEventCount += 1;
+        $activityCount.textContent =
+          activityEventCount + (activityEventCount === 1 ? " event" : " events");
+      }
+
+      function clearPanels() {
+        $activityLog.innerHTML = "";
+        activityEventCount = 0;
+        $activityCount.textContent = "0 events";
+
+        $reportContent.innerHTML = "";
+        $reportStatus.textContent = "streaming";
+
+        $downloadBtn.classList.add("hidden");
+        lastReportMarkdown = "";
+      }
+
+      function setRunning(running) {
+        $submit.disabled = running;
+        $query.disabled = running;
+        $followup.disabled = running;
+        $followupBtn.disabled = running;
+
+        if (running) {
+          $statusText.textContent = "Agent running…";
+          $status.classList.add("live");
+        } else {
+          $status.classList.remove("live");
+          $statusText.textContent = "Ready.";
+        }
+      }
+
+      /**
+       * Render the report markdown into the right-hand panel.
+       *
+       * We support an incremental "word by word" feel by re-rendering the
+       * entire markdown each time it changes — markdown rendering for a few
+       * KB of text is effectively free on modern hardware, and this avoids
+       * having to write a streaming markdown parser by hand.
+       */
+      function renderReport(markdown, { streaming } = { streaming: false }) {
+        const html = marked.parse(markdown || "");
+        $reportContent.innerHTML = html;
+        if (streaming) {
+          // Visual cue that more text is on the way.
+          const last = $reportContent.lastElementChild;
+          if (last) last.classList.add("caret");
+        }
+      }
+
+      /**
+       * Animate `text` into the report panel, a few words at a time, to
+       * give the "streaming" feel even though the server sends the whole
+       * report in a single event.
+       */
+      async function streamReportText(fullText) {
+        const tokens = fullText.split(/(\s+)/); // keep whitespace
+        let acc = "";
+        // Tune chunk size + delay so a typical report renders in ~1.5s.
+        const chunk = Math.max(2, Math.ceil(tokens.length / 120));
+        for (let i = 0; i < tokens.length; i += chunk) {
+          acc += tokens.slice(i, i + chunk).join("");
+          renderReport(acc, { streaming: true });
+          // Auto-scroll the report panel as content grows.
+          const panelBody = $reportContent.parentElement;
+          panelBody.scrollTop = panelBody.scrollHeight;
+          await new Promise((r) => setTimeout(r, 12));
+        }
+        renderReport(fullText, { streaming: false });
+      }
+
+      // ---------------------------------------------------------------------
+      // SSE parsing
+      // ---------------------------------------------------------------------
+
+      /**
+       * Read the streaming response from POST /research, split it into SSE
+       * frames, decode the JSON payloads, and dispatch each event.
+       *
+       * We don't use the built-in EventSource API because EventSource only
+       * supports GET requests; our endpoint accepts a JSON body via POST.
+       */
+      async function consumeStream(response) {
+        if (!response.ok || !response.body) {
+          throw new Error("HTTP " + response.status + " " + response.statusText);
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          // SSE frames are separated by a blank line. Split, process all
+          // complete frames, and keep the trailing partial frame in `buffer`.
+          let sepIndex;
+          while ((sepIndex = buffer.indexOf("\n\n")) !== -1) {
+            const rawFrame = buffer.slice(0, sepIndex);
+            buffer = buffer.slice(sepIndex + 2);
+            handleFrame(rawFrame);
+          }
+        }
+        // Flush any final frame that wasn't terminated by a blank line.
+        if (buffer.trim()) handleFrame(buffer);
+      }
+
+      function handleFrame(rawFrame) {
+        // Each frame may have multiple `data:` lines; concatenate them.
+        const dataLines = rawFrame
+          .split("\n")
+          .filter((l) => l.startsWith("data:"))
+          .map((l) => l.slice(5).trimStart());
+        if (dataLines.length === 0) return;
+        const payload = dataLines.join("\n");
+        let event;
+        try {
+          event = JSON.parse(payload);
+        } catch (err) {
+          logActivity("⚠️ Could not parse server frame: " + payload, "error");
+          return;
+        }
+        dispatchEvent(event);
+      }
+
+      function dispatchEvent(event) {
+        const { type, content } = event || {};
+        switch (type) {
+          case "step":
+            logActivity(content || "", "step");
+            break;
+          case "report":
+            $reportStatus.textContent = "rendering";
+            lastReportMarkdown = content || "";
+            // Fire and forget — the stream may still be open while we
+            // animate the text in.
+            streamReportText(lastReportMarkdown);
+            break;
+          case "done":
+            $reportStatus.textContent = "complete";
+            if (lastReportMarkdown) {
+              $downloadBtn.classList.remove("hidden");
+            }
+            break;
+          case "error":
+            $reportStatus.textContent = "error";
+            logActivity("❌ " + (content || "Unknown error"), "error");
+            break;
+          default:
+            logActivity("• " + JSON.stringify(event), "system");
+        }
+      }
+
+      // ---------------------------------------------------------------------
+      // Submission flow
+      // ---------------------------------------------------------------------
+
+      async function startResearch(query) {
+        if (!query || !query.trim()) return;
+        // Cancel any in-flight request so we never have two streams writing
+        // into the same panel at once.
+        if (activeController) {
+          activeController.abort();
+        }
+        const controller = new AbortController();
+        activeController = controller;
+
+        clearPanels();
+        lastQuery = query.trim();
+        setRunning(true);
+        logActivity("→ Query: " + lastQuery, "system");
+
+        try {
+          const response = await fetch("/research", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ query: lastQuery }),
+            signal: controller.signal,
+          });
+          await consumeStream(response);
+        } catch (err) {
+          if (err.name !== "AbortError") {
+            logActivity("❌ Network error: " + err.message, "error");
+            $reportStatus.textContent = "error";
+          }
+        } finally {
+          if (activeController === controller) activeController = null;
+          setRunning(false);
+        }
+      }
+
+      $form.addEventListener("submit", (e) => {
+        e.preventDefault();
+        startResearch($query.value);
+      });
+
+      $followupForm.addEventListener("submit", (e) => {
+        e.preventDefault();
+        const q = $followup.value;
+        if (!q.trim()) return;
+        $followup.value = "";
+        // Each follow-up is a fresh research run. We could chain history,
+        // but the spec keeps things simple: same endpoint, new query.
+        startResearch(q);
+      });
+
+      // ---------------------------------------------------------------------
+      // Download button: writes the current report markdown to a .md file.
+      // ---------------------------------------------------------------------
+      $downloadBtn.addEventListener("click", () => {
+        if (!lastReportMarkdown) return;
+        const safe = (lastQuery || "report")
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 60) || "report";
+        const blob = new Blob([lastReportMarkdown], {
+          type: "text/markdown;charset=utf-8",
+        });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = safe + ".md";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      });
+
+      // Allow Enter-to-submit in the query field even when the button has
+      // focus (default form behavior already handles this, but make it
+      // explicit for clarity).
+      $query.focus();
+    </script>
+  </body>
+</html>
